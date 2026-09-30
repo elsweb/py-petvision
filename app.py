@@ -1,0 +1,748 @@
+from pathlib import Path
+import re
+import time
+
+import streamlit as st
+
+from config import (
+    MIN_SPECIES_SAMPLES,
+    MIN_BREED_SAMPLES,
+)
+from database import (
+    init_db,
+    add_image,
+    add_prediction,
+    add_feedback,
+    stats,
+)
+from inference import detect, DEVICE
+from storage import save_image
+from training import trainer
+
+
+st.set_page_config(
+    page_title="PetVision Local",
+    page_icon="🐾",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# ---------------------------------------------------------------------------
+# Tailwind + CSS
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            boxShadow: {
+              glow: '0 0 50px rgba(99,102,241,.14)'
+            }
+          }
+        }
+      }
+    </script>
+
+    <style>
+      html, body, [data-testid="stAppViewContainer"] {
+        background:
+          radial-gradient(
+            circle at top left,
+            rgba(99,102,241,.12),
+            transparent 32rem
+          ),
+          #080b14 !important;
+      }
+
+      [data-testid="stHeader"] {
+        background: transparent !important;
+      }
+
+      .block-container {
+        max-width: 1180px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+      }
+
+      .pet-card {
+        background: rgba(15,23,42,.68);
+        border: 1px solid rgba(148,163,184,.13);
+        border-radius: 24px;
+        padding: 22px;
+        box-shadow: 0 0 50px rgba(99,102,241,.07);
+      }
+
+      .pet-result {
+        background: rgba(2,6,23,.72);
+        border: 1px solid rgba(148,163,184,.12);
+        border-radius: 18px;
+        padding: 18px;
+      }
+
+      .pet-muted {
+        color: #64748b;
+        font-size: 13px;
+      }
+
+      .pet-title {
+        color: #f8fafc;
+        font-weight: 800;
+      }
+
+      .pet-accent {
+        color: #a5b4fc;
+      }
+
+      div[data-testid="stFileUploader"] {
+        border-radius: 20px;
+      }
+
+      div[data-testid="stButton"] > button {
+        border-radius: 14px;
+        min-height: 46px;
+        font-weight: 700;
+      }
+
+      .stProgress > div > div > div > div {
+        border-radius: 999px;
+      }
+
+      section[data-testid="stSidebar"] {
+        background: #080b14;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Inicialização
+# ---------------------------------------------------------------------------
+
+init_db()
+
+if "result" not in st.session_state:
+    st.session_state.result = None
+
+if "image_id" not in st.session_state:
+    st.session_state.image_id = None
+
+if "image_path" not in st.session_state:
+    st.session_state.image_path = None
+
+if "species_edit" not in st.session_state:
+    st.session_state.species_edit = "dog"
+
+if "breed_edit" not in st.session_state:
+    st.session_state.breed_edit = ""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def pretty(value):
+    if not value:
+        return "—"
+
+    return str(value).replace(
+        "_",
+        " ",
+    ).title()
+
+
+def confidence(value):
+    return f"{float(value) * 100:.1f}%"
+
+
+def normalize_label(value):
+    """Converte texto livre em um label consistente (snake_case)."""
+    value = (value or "").strip().lower()
+    value = re.sub(r"[^\w]+", "_", value, flags=re.UNICODE)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
+
+
+def progress_card(label, value):
+    st.caption(f"{label} · {int(value)}%")
+    st.progress(
+        max(0.0, min(1.0, value / 100))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <div class="flex items-center justify-between gap-4 mb-8">
+      <div>
+        <div class="pet-accent text-xs font-bold uppercase tracking-[.22em]">
+          Vision Transformer
+        </div>
+        <h1 class="text-3xl sm:text-4xl font-black text-white mt-1">
+          PetVision <span class="text-indigo-400">Local</span>
+        </h1>
+        <p class="text-slate-400 mt-1">
+          Detecção em duas camadas + aprendizado com feedback humano.
+        </p>
+      </div>
+
+      <div class="hidden sm:block rounded-2xl border border-emerald-500/20
+                  bg-emerald-500/5 px-4 py-3">
+        <div class="text-xs text-slate-500">Execução</div>
+        <div class="text-sm font-bold text-emerald-300">
+          ● 100% local
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Upload + detecção
+# ---------------------------------------------------------------------------
+
+left, right = st.columns(
+    [1.05, .95],
+    gap="large",
+)
+
+with left:
+    st.markdown(
+        """
+        <div class="pet-card">
+          <div class="pet-title text-lg">Imagem</div>
+          <div class="pet-muted mt-1">
+            Envie JPG, PNG ou WEBP
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    uploaded = st.file_uploader(
+        "Arraste uma imagem ou selecione um arquivo",
+        type=["jpg", "jpeg", "png", "webp"],
+        label_visibility="collapsed",
+    )
+
+    if uploaded:
+        st.image(
+            uploaded,
+            use_container_width=True,
+        )
+
+        if st.button(
+            "🐾 Detectar animal e raça",
+            use_container_width=True,
+            type="primary",
+        ):
+            try:
+                progress_card(
+                    "Salvando upload",
+                    20,
+                )
+
+                filename, path = save_image(
+                    uploaded
+                )
+
+                image_id = add_image(
+                    filename,
+                    path,
+                )
+
+                st.session_state.image_id = image_id
+                st.session_state.image_path = path
+
+                progress_card(
+                    "Executando Camada 1 + Camada 2",
+                    55,
+                )
+
+                result = detect(path)
+
+                add_prediction(
+                    image_id,
+                    result,
+                )
+
+                st.session_state.result = result
+
+                progress_card(
+                    "Detecção concluída",
+                    100,
+                )
+
+                st.success(
+                    "Imagem analisada com sucesso."
+                )
+
+            except Exception as exc:
+                st.error(str(exc))
+
+
+with right:
+    st.markdown(
+        """
+        <div class="pet-card">
+          <div class="flex items-center gap-3">
+            <div class="text-2xl">🧠</div>
+            <div>
+              <div class="pet-title text-lg">
+                Resultado em 2 camadas
+              </div>
+              <div class="pet-muted">
+                Inferência local com Transformers
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    result = st.session_state.result
+
+    if not result:
+        st.info(
+            "Envie uma imagem para iniciar a detecção."
+        )
+    else:
+        species_top = result["species_top"]
+        breed_top = result["breed_top"]
+
+        st.markdown(
+            f"""
+            <div class="pet-result mt-4">
+              <div class="pet-muted uppercase tracking-wider">
+                Camada 1 · espécie
+              </div>
+
+              <div class="text-2xl font-black text-white mt-2">
+                {pretty(species_top["label"])}
+              </div>
+
+              <div class="text-indigo-300 font-bold mt-1">
+                {confidence(species_top["probability"])}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f"""
+            <div class="pet-result mt-3">
+              <div class="pet-muted uppercase tracking-wider">
+                Camada 2 · raça
+              </div>
+
+              <div class="text-2xl font-black text-white mt-2">
+                {pretty(breed_top["label"])}
+              </div>
+
+              <div class="text-indigo-300 font-bold mt-1">
+                {confidence(breed_top["probability"])}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.caption(
+            f"Dispositivo utilizado: {result['device']}"
+        )
+
+        st.markdown(
+            "### Top classificações"
+        )
+
+        for item in result["breed"]:
+            st.write(
+                f"**{pretty(item['label'])}** — "
+                f"{confidence(item['probability'])}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Correção humana
+# ---------------------------------------------------------------------------
+
+if st.session_state.result:
+    st.divider()
+
+    st.markdown(
+        """
+        <div class="pet-card">
+          <div class="pet-title text-lg">
+            ✏️ Corrigir / enriquecer
+          </div>
+          <div class="pet-muted mt-1">
+            A correção será armazenada e poderá ser usada no retreinamento.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    result = st.session_state.result
+
+    species_label = result["species_top"]["label"].lower()
+
+    if species_label not in ["cat", "dog"]:
+        species_label = "dog"
+
+    species_edit = st.selectbox(
+        "Espécie correta",
+        ["cat", "dog"],
+        index=(
+            0
+            if species_label == "cat"
+            else 1
+        ),
+        format_func=lambda x: (
+            "Gato"
+            if x == "cat"
+            else "Cachorro"
+        ),
+    )
+
+    breed_default = result["breed_top"]["label"]
+
+    known_breeds = sorted({
+        item["label"]
+        for item in result["breed"]
+    } | {
+        breed_default
+    })
+
+    NEW_BREED_OPTION = "➕ Outra raça (digitar)"
+
+    breed_options = known_breeds + [NEW_BREED_OPTION]
+
+    breed_choice = st.selectbox(
+        "Raça correta",
+        breed_options,
+        index=0,
+        format_func=lambda x: (
+            x
+            if x == NEW_BREED_OPTION
+            else pretty(x)
+        ),
+    )
+
+    # ---------------------------------------------------------------------
+    # Novo rótulo: permite enviar várias amostras da mesma raça
+    # ---------------------------------------------------------------------
+
+    extra_samples = []
+    include_current = True
+
+    if breed_choice == NEW_BREED_OPTION:
+        breed_custom = st.text_input(
+            "Nome da raça",
+            placeholder="Ex.: Pastor Alemão, SRD, Maine Coon...",
+            help=(
+                "Digite o nome da raça. O texto será normalizado "
+                "(ex.: 'Pastor Alemão' → 'pastor_alemao') para manter "
+                "consistência com os labels do modelo."
+            ),
+        )
+
+        breed_edit = normalize_label(breed_custom)
+
+        if breed_custom.strip():
+            st.caption(
+                f"Label que será salvo: `{breed_edit}`"
+            )
+
+        include_current = st.checkbox(
+            "Incluir também a imagem detectada acima",
+            value=True,
+            help=(
+                "Desmarque se a imagem acima não pertence à raça "
+                "que você está cadastrando."
+            ),
+        )
+
+        extra_samples = st.file_uploader(
+            "Imagens de amostra para o novo rótulo (opcional)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="new_breed_samples",
+            help=(
+                "Envie várias imagens da mesma raça. Todas serão "
+                "salvas no dataset local com o rótulo digitado acima "
+                "e a espécie selecionada."
+            ),
+        )
+
+        if extra_samples:
+            st.caption(
+                f"{len(extra_samples)} imagem(ns) adicional(is) serão "
+                f"rotuladas como `{breed_edit or '—'}`."
+            )
+    else:
+        breed_edit = breed_choice
+
+    # ---------------------------------------------------------------------
+    # Salvar
+    # ---------------------------------------------------------------------
+
+    if st.button(
+        "💾 Salvar correção para treinamento",
+        use_container_width=True,
+    ):
+        if not breed_edit:
+            st.warning(
+                "Informe o nome da raça antes de salvar."
+            )
+        else:
+            saved = 0
+            failed = 0
+
+            # 1) Imagem detectada (opcional)
+            if include_current and st.session_state.image_id:
+                try:
+                    add_feedback(
+                        st.session_state.image_id,
+                        species_edit,
+                        breed_edit,
+                    )
+                    saved += 1
+                except Exception as exc:
+                    failed += 1
+                    st.error(
+                        f"Falha na imagem detectada: {exc}"
+                    )
+
+            # 2) Amostras adicionais em lote
+            if extra_samples:
+                bar = st.progress(0)
+                status = st.empty()
+                total = len(extra_samples)
+
+                for index, sample in enumerate(extra_samples, start=1):
+                    status.caption(
+                        f"Salvando {index}/{total} · {sample.name}"
+                    )
+
+                    try:
+                        filename, path = save_image(sample)
+                        new_id = add_image(filename, path)
+                        add_feedback(
+                            new_id,
+                            species_edit,
+                            breed_edit,
+                        )
+                        saved += 1
+                    except Exception as exc:
+                        failed += 1
+                        st.error(
+                            f"Falha em {sample.name}: {exc}"
+                        )
+
+                    bar.progress(index / total)
+
+                status.empty()
+                bar.empty()
+
+            if saved:
+                st.success(
+                    f"{saved} imagem(ns) salva(s) no dataset local "
+                    f"com o rótulo `{breed_edit}`."
+                )
+
+            if failed:
+                st.warning(
+                    f"{failed} imagem(ns) falharam ao salvar."
+                )
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+st.divider()
+
+current_stats = stats()
+
+st.markdown(
+    """
+    <div class="pet-card">
+      <div class="pet-title text-lg">
+        📚 Dataset local
+      </div>
+      <div class="pet-muted mt-1">
+        Imagens confirmadas manualmente e disponíveis para treinamento.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.metric(
+        "Exemplos rotulados",
+        current_stats["total"],
+    )
+
+with c2:
+    st.metric(
+        "Mínimo espécie",
+        MIN_SPECIES_SAMPLES,
+    )
+
+with c3:
+    st.metric(
+        "Mínimo raça",
+        MIN_BREED_SAMPLES,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Treinamento
+# ---------------------------------------------------------------------------
+
+st.divider()
+
+st.markdown(
+    """
+    <div class="pet-card">
+      <div class="pet-title text-lg">
+        🔄 Retreinamento local
+      </div>
+      <div class="pet-muted mt-1">
+        Fine-tuning do Vision Transformer com os dados corrigidos.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+train_col1, train_col2 = st.columns(2)
+
+with train_col1:
+    layer = st.selectbox(
+        "Camada",
+        ["species", "breed"],
+        format_func=lambda x: (
+            "Camada 1 · Gato/Cachorro"
+            if x == "species"
+            else "Camada 2 · Raça"
+        ),
+    )
+
+with train_col2:
+    epochs = st.selectbox(
+        "Épocas",
+        [1, 2, 3, 5],
+        index=1,
+    )
+
+state = trainer.state()
+
+if state["running"]:
+    progress_card(
+        f"Treinando {state['layer']}",
+        state["progress"],
+    )
+
+    st.info(
+        state["message"]
+    )
+
+    time.sleep(.25)
+    st.rerun()
+
+if st.button(
+    "🚀 Retreinar modelo",
+    use_container_width=True,
+    disabled=state["running"],
+):
+    try:
+        trainer.start(
+            layer,
+            epochs,
+        )
+
+        st.rerun()
+
+    except Exception as exc:
+        st.error(str(exc))
+
+
+state = trainer.state()
+
+if (
+    state["result"]
+    and not state["running"]
+):
+    result_train = state["result"]
+
+    st.success(
+        state["message"]
+    )
+
+    a, b, c = st.columns(3)
+
+    with a:
+        st.metric(
+            "Amostras",
+            result_train["samples"],
+        )
+
+    with b:
+        st.metric(
+            "Loss",
+            f"{result_train['loss']:.4f}",
+        )
+
+    with c:
+        st.metric(
+            "Validação",
+            f"{result_train['accuracy'] * 100:.1f}%",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Histórico
+# ---------------------------------------------------------------------------
+
+with st.expander(
+    "📊 Histórico de treinamentos"
+):
+    if current_stats["runs"]:
+        st.dataframe(
+            current_stats["runs"],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption(
+            "Nenhum treinamento executado ainda."
+        )
+
+
+st.markdown(
+    """
+    <div class="text-center text-xs text-slate-600 mt-10">
+      PetVision Local · Streamlit · PyTorch · Transformers
+    </div>
+    """,
+    unsafe_allow_html=True,
+)

@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Database
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Uploaded dataset
+data/images/*
+!data/images/.gitkeep
+
+# Hugging Face / ML weights
+models/*
+!models/species/.gitkeep
+!models/breed/.gitkeep
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
