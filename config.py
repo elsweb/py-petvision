@@ -14,7 +14,8 @@ DB_PATH = DATA_DIR / "petvision.db"
 
 SPECIES_MODEL = os.getenv(
     "PETVISION_SPECIES_MODEL",
-    "akahana/vit-base-cats-vs-dogs",
+    "Nomi5911/animal_model_results",
+    # "akahana/vit-base-cats-vs-dogs",
 )
 
 BREED_MODEL = os.getenv(
