@@ -1,12 +1,21 @@
 from pathlib import Path
 import re
 import time
+import math
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
 
 import streamlit as st
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+from sklearn.metrics import classification_report
 
 from config import (
     MIN_SPECIES_SAMPLES,
     MIN_BREED_SAMPLES,
+    SPECIES_DIR,
+    BREED_DIR,
 )
 from database import (
     init_db,
@@ -14,6 +23,7 @@ from database import (
     add_prediction,
     add_feedback,
     stats,
+    feedback_rows,
 )
 from inference import detect, DEVICE
 from storage import save_image
@@ -108,6 +118,31 @@ st.markdown(
         letter-spacing: 0.5px;
       }
 
+      /* Cards de Métricas Customizados */
+      .metric-card {
+          background: rgba(15, 23, 42, 0.5);
+          border: 1px solid rgba(148, 163, 184, 0.1);
+          border-radius: 12px;
+          padding: 12px 16px;
+          text-align: center;
+      }
+      .metric-title {
+          font-size: 12px;
+          color: #94a3b8;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          margin-bottom: 4px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+      }
+      .metric-value {
+          font-size: 24px;
+          font-weight: 900;
+          color: #f8fafc;
+      }
+
       div[data-testid="stFileUploader"] {
         border-radius: 20px;
       }
@@ -129,6 +164,27 @@ st.markdown(
       /* Ajuste para remover espaçamentos fantasmas do Streamlit */
       div[data-testid="stMarkdownContainer"] > div {
          margin-bottom: 0px;
+      }
+
+      /* Estilo para o ícone de interrogação */
+      .help-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background-color: rgba(148,163,184,0.2);
+        color: #94a3b8;
+        font-size: 10px;
+        font-weight: bold;
+        cursor: help;
+        margin-left: 4px;
+        text-decoration: none;
+      }
+      .help-icon:hover {
+        background-color: rgba(148,163,184,0.4);
+        color: #f8fafc;
       }
     </style>
     """,
@@ -159,6 +215,12 @@ if "species_edit" not in st.session_state:
 if "breed_edit" not in st.session_state:
     st.session_state.breed_edit = ""
 
+# NOVO: Guardar as métricas calculadas para não recalcular a cada rerun
+if "metricas_species" not in st.session_state:
+    st.session_state.metricas_species = None
+if "metricas_breed" not in st.session_state:
+    st.session_state.metricas_breed = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -184,6 +246,138 @@ def normalize_label(value):
 def progress_card(label, value):
     st.caption(f"{label} · {int(value)}%")
     st.progress(max(0.0, min(1.0, value / 100)))
+
+
+def calc_entropy(probs):
+    """Calcula a entropia de uma lista de probabilidades."""
+    return -sum(p * math.log2(p) for p in probs if p > 0)
+
+
+# ---------------------------------------------------------------------------
+# CÁLCULO DE MÉTRICAS REAIS (Reutilizável)
+# ---------------------------------------------------------------------------
+
+def calcular_metricas_reais(layer, label_key, base_dir):
+    """Carrega o modelo e roda a inferência para calcular métricas reais."""
+    custom_dir = Path(base_dir).parent / "custom" / layer
+
+    if not (custom_dir / "config.json").exists():
+        return None
+
+    try:
+        processor = AutoImageProcessor.from_pretrained(custom_dir)
+        model = AutoModelForImageClassification.from_pretrained(custom_dir)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+
+        rows = feedback_rows()
+        valid_rows = [r for r in rows if r.get(label_key)]
+
+        if len(valid_rows) < 2:
+            return None
+
+        y_true = []
+        y_pred = []
+        id2label = model.config.id2label
+        label2id = model.config.label2id
+
+        with torch.inference_mode():
+            for row in valid_rows:
+                true_label_text = row[label_key]
+                
+                if true_label_text not in label2id:
+                    continue
+
+                try:
+                    image = Image.open(row["path"]).convert("RGB")
+                    inputs = processor(images=image, return_tensors="pt").to(device)
+                    logits = model(**inputs).logits
+                    pred_id = logits.argmax(dim=-1).item()
+                    
+                    y_true.append(true_label_text)
+                    y_pred.append(id2label[pred_id])
+                except Exception:
+                    continue
+
+        if not y_true:
+            return None
+
+        labels_presentes = sorted(list(set(y_true + y_pred)))
+        
+        report = classification_report(y_true, y_pred, labels=labels_presentes, output_dict=True, zero_division=0)
+        
+        weighted_avg = report.get("weighted avg", {})
+        
+        return {
+            "report": report,
+            "accuracy": report.get("accuracy", 0.0),
+            "precision": weighted_avg.get("precision", 0.0),
+            "recall": weighted_avg.get("recall", 0.0),
+            "f1": weighted_avg.get("f1-score", 0.0),
+        }
+
+    except Exception as e:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# POPUP DE MÉTRICAS DETALHADAS
+# ---------------------------------------------------------------------------
+
+@st.dialog("Relatório de Classificação Detalhado", width="large")
+def mostrar_popup_metricas():
+    st.markdown("### Relatório de Classificação por Classe")
+    st.caption("Mostra o desempenho do modelo para cada classe individualmente.")
+    
+    # Verifica qual modelo foi treinado para exibir por padrão
+    tem_species = st.session_state.metricas_species is not None
+    tem_breed = st.session_state.metricas_breed is not None
+
+    if not tem_species and not tem_breed:
+        st.warning("Nenhum modelo treinado encontrado.")
+        return
+
+    opcoes = []
+    if tem_species:
+        opcoes.append("Espécie (Gato/Cachorro)")
+    if tem_breed:
+        opcoes.append("Raça")
+        
+    camada = st.radio("Selecione a camada:", opcoes, horizontal=True)
+    
+    if camada.startswith("Espécie"):
+        metrics_data = st.session_state.metricas_species
+    else:
+        metrics_data = st.session_state.metricas_breed
+
+    if metrics_data is None:
+        st.warning("Sem dados para esta camada.")
+        return
+
+    # --- EXIBIR TABELA DE RELATÓRIO ---
+    df_report = pd.DataFrame(metrics_data["report"]).transpose()
+    
+    # Renomeia as colunas para ficarem mais amigáveis
+    df_report = df_report.rename(columns={
+        "precision": "Precisão",
+        "recall": "Recall",
+        "f1-score": "F1-Score",
+        "support": "Suporte"
+    })
+    
+    st.dataframe(
+        df_report.style.format({
+            "Precisão": "{:.2f}",
+            "Recall": "{:.2f}",
+            "F1-Score": "{:.2f}",
+            "Suporte": "{:.0f}"
+        }),
+        use_container_width=True
+    )
+
+    if st.button("Fechar", use_container_width=True):
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +485,6 @@ with right:
         species_top = result["species_top"]
         is_pet = species_top["label"].lower() in ["cat", "dog"]
 
-        # Espaçador FIXO
         st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
 
         # CARD CAMADA 1 ENRIQUECIDO
@@ -302,8 +495,9 @@ with right:
             <div class="pet-result">
               <div class="flex justify-between items-start">
                   <div>
-                      <div class="pet-muted uppercase tracking-wider mb-1">
+                      <div class="pet-muted uppercase tracking-wider mb-1 flex items-center">
                         Camada 1 · Espécie
+                        <span class="help-icon" title="Probabilidade do modelo de que o animal pertence a esta espécie.">?</span>
                       </div>
                       <div class="text-2xl font-black text-white">
                         {pretty(species_top["label"])}
@@ -321,13 +515,15 @@ with right:
         if second_species:
             species_html += f"""
               <div class="mt-3 pt-3 border-t border-slate-700/50 flex justify-between items-center">
-                  <span class="pet-muted text-xs">2ª opção: {pretty(second_species['label'])}</span>
+                  <span class="pet-muted text-xs flex items-center">
+                    2ª opção: {pretty(second_species['label'])}
+                    <span class="help-icon" title="Segunda espécie mais provável segundo o modelo.">?</span>
+                  </span>
                   <span class="text-slate-400 text-xs font-bold">{confidence(second_species['probability'])}</span>
               </div>
             """
             
         species_html += "</div>"
-        
         st.markdown(species_html, unsafe_allow_html=True)
 
         # CARD CAMADA 2 ENRIQUECIDO (Se for pet)
@@ -340,8 +536,9 @@ with right:
                 <div class="pet-result">
                   <div class="flex justify-between items-start">
                       <div>
-                          <div class="pet-muted uppercase tracking-wider mb-1">
+                          <div class="pet-muted uppercase tracking-wider mb-1 flex items-center">
                             Camada 2 · Raça
+                            <span class="help-icon" title="Probabilidade do modelo de que o animal pertence a esta raça específica.">?</span>
                           </div>
                           <div class="text-2xl font-black text-white">
                             {pretty(breed_top["label"])}
@@ -356,14 +553,12 @@ with right:
                   </div>
             """
             
-            # Adiciona o Top 3 de raças
             top_breeds = result.get("breed", [])[:3]
             if len(top_breeds) > 1:
                 breed_html += '<div class="mt-3 pt-3 border-t border-slate-700/50 space-y-1">'
                 breed_html += '<div class="pet-muted text-xs mb-2 uppercase tracking-wider">Top 3 Raças</div>'
                 
                 for idx, item in enumerate(top_breeds, start=1):
-                    # AJUSTE: Removida a indentação (espaços à esquerda) para o Streamlit não ler como código
                     breed_html += f'<div class="flex justify-between items-center text-sm"><span class="text-slate-300">{idx}. {pretty(item["label"])}</span><span class="text-slate-400 font-medium">{confidence(item["probability"])}</span></div>'
                 
                 breed_html += '</div>'
@@ -374,9 +569,52 @@ with right:
             st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
             st.info("A camada de raça não é aplicada para esta espécie.")
 
-        # METADADOS DA INFERÊNCIA (Tempo, Dispositivo)
+        # ---------------------------------------------------------
+        # MÉTRICAS POR IMAGEM (Gap e Entropia)
+        # ---------------------------------------------------------
         st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
         
+        gap_species = 0.0
+        if len(top_species) > 1:
+            gap_species = top_species[0]["probability"] - top_species[1]["probability"]
+            
+        probs_species = [item["probability"] for item in top_species]
+        entropy_val = calc_entropy(probs_species)
+        
+        if gap_species > 0.5:
+            gap_status = "Alta Certeza"
+            gap_color = "text-emerald-400"
+        elif gap_species > 0.15:
+            gap_status = "Moderada"
+            gap_color = "text-amber-400"
+        else:
+            gap_status = "Baixa (Dúvida)"
+            gap_color = "text-rose-400"
+
+        metrics_html = f"""
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-slate-800/30 p-3 rounded-xl border border-slate-700/50">
+                    <div class="text-xs text-slate-400 uppercase tracking-wider mb-1 flex items-center">
+                        Gap (Top1 - Top2)
+                        <span class="help-icon" title="A diferença entre a probabilidade da 1ª e da 2ª opção. Valores altos indicam que o modelo está confiante na escolha.">?</span>
+                    </div>
+                    <div class="text-lg font-bold {gap_color}">{gap_species*100:.1f}%</div>
+                    <div class="text-[10px] text-slate-500">{gap_status}</div>
+                </div>
+                <div class="bg-slate-800/30 p-3 rounded-xl border border-slate-700/50">
+                    <div class="text-xs text-slate-400 uppercase tracking-wider mb-1 flex items-center">
+                        Entropia
+                        <span class="help-icon" title="Medida matemática de incerteza. Quanto menor o valor, mais confiante o modelo está.">?</span>
+                    </div>
+                    <div class="text-lg font-bold text-white">{entropy_val:.3f}</div>
+                    <div class="text-[10px] text-slate-500">Incerteza da predição</div>
+                </div>
+            </div>
+        """
+        st.markdown(metrics_html, unsafe_allow_html=True)
+
+        # METADADOS DA INFERÊNCIA (Tempo, Dispositivo)
+        st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
         inf_time = st.session_state.get("inference_time", 0.0)
         
         st.markdown(f"""
@@ -386,7 +624,10 @@ with right:
                     <span class="pet-badge bg-indigo-500/20 text-indigo-300">{result['device'].upper()}</span>
                 </div>
                 <div class="flex items-center gap-2">
-                    <span class="text-slate-400 text-xs uppercase tracking-wider">Tempo</span>
+                    <span class="text-slate-400 text-xs uppercase tracking-wider flex items-center">
+                        Tempo
+                        <span class="help-icon" title="Tempo total que o modelo levou para processar a imagem.">?</span>
+                    </span>
                     <span class="pet-badge bg-emerald-500/20 text-emerald-300">{inf_time:.3f}s</span>
                 </div>
             </div>
@@ -508,34 +749,115 @@ if st.session_state.result:
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset e Métricas Globais
 # ---------------------------------------------------------------------------
 
 st.divider()
 current_stats = stats()
 
-st.markdown(
-    """
-    <div class="pet-card">
-      <div class="pet-title text-lg">
-        📚 Dataset local
-      </div>
-      <div class="pet-muted mt-1">
-        Imagens confirmadas manualmente e disponíveis para treinamento.
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# Calcula as métricas se ainda não estiverem no session_state
+if st.session_state.metricas_species is None and current_stats.get("runs"):
+    st.session_state.metricas_species = calcular_metricas_reais("species", "species", SPECIES_DIR)
+    st.session_state.metricas_breed = calcular_metricas_reais("breed", "breed", BREED_DIR)
 
-c1, c2, c3 = st.columns(3)
 
-with c1:
-    st.metric("Exemplos rotulados", current_stats["total"])
-with c2:
-    st.metric("Mínimo espécie", MIN_SPECIES_SAMPLES)
-with c3:
-    st.metric("Mínimo raça", MIN_BREED_SAMPLES)
+col_dataset, col_metrics = st.columns([1, 1], gap="large")
+
+with col_dataset:
+    st.markdown(
+        """
+        <div class="pet-card h-full">
+          <div class="pet-title text-lg">
+            📚 Dataset local
+          </div>
+          <div class="pet-muted mt-1">
+            Imagens confirmadas manualmente e disponíveis para treinamento.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.metric("Rotulados", current_stats["total"], help="Total de imagens já corrigidas e salvas por você.")
+    with c2:
+        st.metric("Min. Espécie", MIN_SPECIES_SAMPLES, help="Número mínimo de imagens necessárias para treinar a Camada 1 (Gato/Cachorro).")
+    with c3:
+        st.metric("Min. Raça", MIN_BREED_SAMPLES, help="Número mínimo de imagens por raça necessárias para treinar a Camada 2.")
+
+with col_metrics:
+    c_header, c_btn = st.columns([4, 1])
+    
+    with c_header:
+        st.markdown(
+            """
+            <div class="pet-title text-lg">
+              📈 Métricas Globais do Modelo
+            </div>
+            <div class="pet-muted mt-1">
+              Desempenho no último treinamento.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    
+    with c_btn:
+        # Só mostra o botão se houver algum modelo treinado
+        if st.session_state.metricas_species or st.session_state.metricas_breed:
+            if st.button("➕", help="Ver Relatório Detalhado", use_container_width=True):
+                mostrar_popup_metricas()
+
+    # Decide qual métrica exibir no card principal (prioriza Raça se existir, senão Espécie)
+    metrics_data = st.session_state.metricas_breed if st.session_state.metricas_breed else st.session_state.metricas_species
+    tipo_modelo = "Raça" if st.session_state.metricas_breed else "Espécie"
+
+    if metrics_data:
+        # Formata os números de forma segura
+        acc_str = f"{metrics_data['accuracy']*100:.1f}%"
+        prec_str = f"{metrics_data['precision']*100:.1f}%"
+        rec_str = f"{metrics_data['recall']*100:.1f}%"
+        f1_str = f"{metrics_data['f1']*100:.1f}%"
+
+        st.caption(f"Exibindo métricas do modelo treinado: **{tipo_modelo}**")
+        
+        # Usando st.columns + HTML customizado para não cortar os números
+        m1, m2, m3, m4 = st.columns(4)
+        
+        with m1:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">Acurácia <span class="help-icon" title="Porcentagem geral de acertos.">?</span></div>
+                    <div class="metric-value">{acc_str}</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+        with m2:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">Precisão <span class="help-icon" title="Média ponderada de precisão.">?</span></div>
+                    <div class="metric-value">{prec_str}</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+        with m3:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">Recall <span class="help-icon" title="Média ponderada de recall.">?</span></div>
+                    <div class="metric-value">{rec_str}</div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+        with m4:
+            st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-title">F1-Score <span class="help-icon" title="Média harmônica entre precisão e recall.">?</span></div>
+                    <div class="metric-value">{f1_str}</div>
+                </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("Nenhum treinamento com métricas registradas foi encontrado. Treine um modelo para visualizar.")
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +902,9 @@ if state["running"]:
 if st.button("🚀 Retreinar modelo", use_container_width=True, disabled=state["running"]):
     try:
         trainer.start(layer, epochs)
+        # Limpa o cache de métricas para forçar o recálculo após o treino
+        st.session_state.metricas_species = None
+        st.session_state.metricas_breed = None
         st.rerun()
     except Exception as exc:
         st.error(str(exc))
@@ -593,9 +918,9 @@ if state["result"] and not state["running"]:
     with a:
         st.metric("Amostras", result_train["samples"])
     with b:
-        st.metric("Loss", f"{result_train['loss']:.4f}")
+        st.metric("Loss", f"{result_train['loss']:.4f}", help="Erro do modelo durante o treinamento. Quanto menor, melhor.")
     with c:
-        st.metric("Validação", f"{result_train['accuracy'] * 100:.1f}%")
+        st.metric("Validação", f"{result_train['accuracy'] * 100:.1f}%", help="Acurácia nos dados de validação.")
 
 
 # ---------------------------------------------------------------------------
