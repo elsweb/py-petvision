@@ -98,6 +98,15 @@ st.markdown(
       .pet-accent {
         color: #a5b4fc;
       }
+      
+      .pet-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+      }
 
       div[data-testid="stFileUploader"] {
         border-radius: 20px;
@@ -135,6 +144,8 @@ init_db()
 
 if "result" not in st.session_state:
     st.session_state.result = None
+if "inference_time" not in st.session_state:
+    st.session_state.inference_time = 0.0
 
 if "image_id" not in st.session_state:
     st.session_state.image_id = None
@@ -156,11 +167,7 @@ if "breed_edit" not in st.session_state:
 def pretty(value):
     if not value:
         return "—"
-
-    return str(value).replace(
-        "_",
-        " ",
-    ).title()
+    return str(value).replace("_", " ").title()
 
 
 def confidence(value):
@@ -168,7 +175,6 @@ def confidence(value):
 
 
 def normalize_label(value):
-    """Converte texto livre em um label consistente (snake_case)."""
     value = (value or "").strip().lower()
     value = re.sub(r"[^\w]+", "_", value, flags=re.UNICODE)
     value = re.sub(r"_+", "_", value).strip("_")
@@ -177,9 +183,7 @@ def normalize_label(value):
 
 def progress_card(label, value):
     st.caption(f"{label} · {int(value)}%")
-    st.progress(
-        max(0.0, min(1.0, value / 100))
-    )
+    st.progress(max(0.0, min(1.0, value / 100)))
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +222,7 @@ st.markdown(
 # Upload + detecção
 # ---------------------------------------------------------------------------
 
-left, right = st.columns(
-    [1.05, .95],
-    gap="large",
-)
+left, right = st.columns([1.05, .95], gap="large")
 
 with left:
     st.markdown("#### Imagem")
@@ -234,56 +235,28 @@ with left:
     )
 
     if uploaded:
-        st.image(
-            uploaded,
-            use_container_width=True,
-        )
+        st.image(uploaded, use_container_width=True)
 
-        if st.button(
-            "🐾 Detectar animal e raça",
-            use_container_width=True,
-            type="primary",
-        ):
+        if st.button("🐾 Detectar animal e raça", use_container_width=True, type="primary"):
             try:
-                progress_card(
-                    "Salvando upload",
-                    20,
-                )
-
-                filename, path = save_image(
-                    uploaded
-                )
-
-                image_id = add_image(
-                    filename,
-                    path,
-                )
+                progress_card("Salvando upload", 20)
+                filename, path = save_image(uploaded)
+                image_id = add_image(filename, path)
 
                 st.session_state.image_id = image_id
                 st.session_state.image_path = path
 
-                progress_card(
-                    "Executando Camada 1 + Camada 2",
-                    55,
-                )
-
+                progress_card("Executando Camada 1 + Camada 2", 55)
+                
+                start_time = time.time()
                 result = detect(path)
+                st.session_state.inference_time = time.time() - start_time
 
-                add_prediction(
-                    image_id,
-                    result,
-                )
-
+                add_prediction(image_id, result)
                 st.session_state.result = result
 
-                progress_card(
-                    "Detecção concluída",
-                    100,
-                )
-
-                st.success(
-                    "Imagem analisada com sucesso."
-                )
+                progress_card("Detecção concluída", 100)
+                st.success("Imagem analisada com sucesso.")
 
             except Exception as exc:
                 st.error(str(exc))
@@ -312,87 +285,112 @@ with right:
     result = st.session_state.result
 
     if not result:
-        # AJUSTE: Adicionado espaçador físico aqui também para manter a simetria
         st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
-        st.info(
-            "Envie uma imagem para iniciar a detecção."
-        )
+        st.info("Envie uma imagem para iniciar a detecção.")
     else:
         species_top = result["species_top"]
-        
-        # Verifica se a espécie detectada é gato ou cachorro
         is_pet = species_top["label"].lower() in ["cat", "dog"]
 
-        # AJUSTE: Espaçador físico FIXO que sempre será renderizado, independente do estado
+        # Espaçador FIXO
         st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
 
-        st.markdown(
-            f"""
+        # CARD CAMADA 1 ENRIQUECIDO
+        top_species = result.get("species", [])
+        second_species = top_species[1] if len(top_species) > 1 else None
+        
+        species_html = f"""
             <div class="pet-result">
-              <div class="pet-muted uppercase tracking-wider">
-                Camada 1 · espécie
+              <div class="flex justify-between items-start">
+                  <div>
+                      <div class="pet-muted uppercase tracking-wider mb-1">
+                        Camada 1 · Espécie
+                      </div>
+                      <div class="text-2xl font-black text-white">
+                        {pretty(species_top["label"])}
+                      </div>
+                  </div>
+                  <div class="text-right">
+                      <div class="text-indigo-300 font-bold text-xl">
+                        {confidence(species_top["probability"])}
+                      </div>
+                      <div class="pet-muted text-xs mt-1">Confiança</div>
+                  </div>
               </div>
-
-              <div class="text-2xl font-black text-white mt-2">
-                {pretty(species_top["label"])}
+        """
+        
+        if second_species:
+            species_html += f"""
+              <div class="mt-3 pt-3 border-t border-slate-700/50 flex justify-between items-center">
+                  <span class="pet-muted text-xs">2ª opção: {pretty(second_species['label'])}</span>
+                  <span class="text-slate-400 text-xs font-bold">{confidence(second_species['probability'])}</span>
               </div>
+            """
+            
+        species_html += "</div>"
+        
+        st.markdown(species_html, unsafe_allow_html=True)
 
-              <div class="text-indigo-300 font-bold mt-1">
-                {confidence(species_top["probability"])}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Só exibe a camada 2 se for gato ou cachorro
+        # CARD CAMADA 2 ENRIQUECIDO (Se for pet)
         if is_pet:
             breed_top = result["breed_top"]
             
-            # AJUSTE: Espaçador físico antes da Camada 2
             st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
             
-            st.markdown(
-                f"""
+            breed_html = f"""
                 <div class="pet-result">
-                  <div class="pet-muted uppercase tracking-wider">
-                    Camada 2 · raça
+                  <div class="flex justify-between items-start">
+                      <div>
+                          <div class="pet-muted uppercase tracking-wider mb-1">
+                            Camada 2 · Raça
+                          </div>
+                          <div class="text-2xl font-black text-white">
+                            {pretty(breed_top["label"])}
+                          </div>
+                      </div>
+                      <div class="text-right">
+                          <div class="text-indigo-300 font-bold text-xl">
+                            {confidence(breed_top["probability"])}
+                          </div>
+                          <div class="pet-muted text-xs mt-1">Confiança</div>
+                      </div>
                   </div>
-
-                  <div class="text-2xl font-black text-white mt-2">
-                    {pretty(breed_top["label"])}
-                  </div>
-
-                  <div class="text-indigo-300 font-bold mt-1">
-                    {confidence(breed_top["probability"])}
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            """
+            
+            # Adiciona o Top 3 de raças
+            top_breeds = result.get("breed", [])[:3]
+            if len(top_breeds) > 1:
+                breed_html += '<div class="mt-3 pt-3 border-t border-slate-700/50 space-y-1">'
+                breed_html += '<div class="pet-muted text-xs mb-2 uppercase tracking-wider">Top 3 Raças</div>'
+                
+                for idx, item in enumerate(top_breeds, start=1):
+                    # AJUSTE: Removida a indentação (espaços à esquerda) para o Streamlit não ler como código
+                    breed_html += f'<div class="flex justify-between items-center text-sm"><span class="text-slate-300">{idx}. {pretty(item["label"])}</span><span class="text-slate-400 font-medium">{confidence(item["probability"])}</span></div>'
+                
+                breed_html += '</div>'
+                
+            breed_html += "</div>"
+            st.markdown(breed_html, unsafe_allow_html=True)
         else:
             st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
-            st.info(
-                "A camada de raça não é aplicada para esta espécie."
-            )
+            st.info("A camada de raça não é aplicada para esta espécie.")
 
-        # Adicionado espaçamento antes do caption
-        st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
-        st.caption(
-            f"Dispositivo utilizado: {result['device']}"
-        )
-
-        # Só exibe as top classificações de raça se for pet
-        if is_pet:
-            st.markdown(
-                "### Top classificações"
-            )
-
-            for item in result["breed"]:
-                st.write(
-                    f"**{pretty(item['label'])}** — "
-                    f"{confidence(item['probability'])}"
-                )
+        # METADADOS DA INFERÊNCIA (Tempo, Dispositivo)
+        st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
+        
+        inf_time = st.session_state.get("inference_time", 0.0)
+        
+        st.markdown(f"""
+            <div class="flex justify-between items-center bg-slate-800/30 p-3 rounded-xl border border-slate-700/50">
+                <div class="flex items-center gap-2">
+                    <span class="text-slate-400 text-xs uppercase tracking-wider">Dispositivo</span>
+                    <span class="pet-badge bg-indigo-500/20 text-indigo-300">{result['device'].upper()}</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="text-slate-400 text-xs uppercase tracking-wider">Tempo</span>
+                    <span class="pet-badge bg-emerald-500/20 text-emerald-300">{inf_time:.3f}s</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -417,51 +415,30 @@ if st.session_state.result:
     )
 
     result = st.session_state.result
-
     species_label = result["species_top"]["label"].lower()
-    
     species_options = ["cat", "dog"]
     
-    if species_label in species_options:
-        species_index = species_options.index(species_label)
-    else:
-        species_index = None 
+    species_index = species_options.index(species_label) if species_label in species_options else None 
 
     species_edit = st.selectbox(
         "Espécie correta",
         species_options,
         index=species_index,
-        format_func=lambda x: (
-            "Gato"
-            if x == "cat"
-            else "Cachorro"
-        ),
+        format_func=lambda x: "Gato" if x == "cat" else "Cachorro",
         placeholder="Selecione a espécie correta...",
     )
 
     if species_edit in ["cat", "dog"]:
         breed_default = result["breed_top"]["label"]
-
-        known_breeds = sorted({
-            item["label"]
-            for item in result["breed"]
-        } | {
-            breed_default
-        })
-
+        known_breeds = sorted({item["label"] for item in result["breed"]} | {breed_default})
         NEW_BREED_OPTION = "➕ Outra raça (digitar)"
-
         breed_options = known_breeds + [NEW_BREED_OPTION]
 
         breed_choice = st.selectbox(
             "Raça correta",
             breed_options,
             index=0,
-            format_func=lambda x: (
-                x
-                if x == NEW_BREED_OPTION
-                else pretty(x)
-            ),
+            format_func=lambda x: x if x == NEW_BREED_OPTION else pretty(x),
         )
 
         extra_samples = []
@@ -471,74 +448,36 @@ if st.session_state.result:
             breed_custom = st.text_input(
                 "Nome da raça",
                 placeholder="Ex.: Pastor Alemão, SRD, Maine Coon...",
-                help=(
-                    "Digite o nome da raça. O texto será normalizado "
-                    "(ex.: 'Pastor Alemão' → 'pastor_alemao') para manter "
-                    "consistência com os labels do modelo."
-                ),
+                help="Digite o nome da raça.",
             )
-
             breed_edit = normalize_label(breed_custom)
-
             if breed_custom.strip():
-                st.caption(
-                    f"Label que será salvo: `{breed_edit}`"
-                )
-
-            include_current = st.checkbox(
-                "Incluir também a imagem detectada acima",
-                value=True,
-                help=(
-                    "Desmarque se a imagem acima não pertence à raça "
-                    "que você está cadastrando."
-                ),
-            )
-
+                st.caption(f"Label que será salvo: `{breed_edit}`")
+            include_current = st.checkbox("Incluir também a imagem detectada acima", value=True)
             extra_samples = st.file_uploader(
                 "Imagens de amostra para o novo rótulo (opcional)",
                 type=["jpg", "jpeg", "png", "webp"],
                 accept_multiple_files=True,
                 key="new_breed_samples",
-                help=(
-                    "Envie várias imagens da mesma raça. Todas serão "
-                    "salvas no dataset local com o rótulo digitado acima "
-                    "e a espécie selecionada."
-                ),
             )
-
             if extra_samples:
-                st.caption(
-                    f"{len(extra_samples)} imagem(ns) adicional(is) serão "
-                    f"rotuladas como `{breed_edit or '—'}`."
-                )
+                st.caption(f"{len(extra_samples)} imagem(ns) adicional(is) serão rotuladas como `{breed_edit or '—'}`.")
         else:
             breed_edit = breed_choice
 
-        if st.button(
-            "💾 Salvar correção para treinamento",
-            use_container_width=True,
-        ):
+        if st.button("💾 Salvar correção para treinamento", use_container_width=True):
             if not breed_edit:
-                st.warning(
-                    "Informe o nome da raça antes de salvar."
-                )
+                st.warning("Informe o nome da raça antes de salvar.")
             else:
                 saved = 0
                 failed = 0
-
                 if include_current and st.session_state.image_id:
                     try:
-                        add_feedback(
-                            st.session_state.image_id,
-                            species_edit,
-                            breed_edit,
-                        )
+                        add_feedback(st.session_state.image_id, species_edit, breed_edit)
                         saved += 1
                     except Exception as exc:
                         failed += 1
-                        st.error(
-                            f"Falha na imagem detectada: {exc}"
-                        )
+                        st.error(f"Falha na imagem detectada: {exc}")
 
                 if extra_samples:
                     bar = st.progress(0)
@@ -546,45 +485,26 @@ if st.session_state.result:
                     total = len(extra_samples)
 
                     for index, sample in enumerate(extra_samples, start=1):
-                        status.caption(
-                            f"Salvando {index}/{total} · {sample.name}"
-                        )
-
+                        status.caption(f"Salvando {index}/{total} · {sample.name}")
                         try:
                             filename, path = save_image(sample)
                             new_id = add_image(filename, path)
-                            add_feedback(
-                                new_id,
-                                species_edit,
-                                breed_edit,
-                            )
+                            add_feedback(new_id, species_edit, breed_edit)
                             saved += 1
                         except Exception as exc:
                             failed += 1
-                            st.error(
-                                f"Falha em {sample.name}: {exc}"
-                            )
-
+                            st.error(f"Falha em {sample.name}: {exc}")
                         bar.progress(index / total)
 
                     status.empty()
                     bar.empty()
 
                 if saved:
-                    st.success(
-                        f"{saved} imagem(ns) salva(s) no dataset local "
-                        f"com o rótulo `{breed_edit}`."
-                    )
-
+                    st.success(f"{saved} imagem(ns) salva(s) no dataset local com o rótulo `{breed_edit}`.")
                 if failed:
-                    st.warning(
-                        f"{failed} imagem(ns) falharam ao salvar."
-                    )
+                    st.warning(f"{failed} imagem(ns) falharam ao salvar.")
     else:
-        st.info(
-            "A correção de raça só está disponível para cães e gatos. "
-            "Selecione a espécie correta acima."
-        )
+        st.info("A correção de raça só está disponível para cães e gatos. Selecione a espécie correta acima.")
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +512,6 @@ if st.session_state.result:
 # ---------------------------------------------------------------------------
 
 st.divider()
-
 current_stats = stats()
 
 st.markdown(
@@ -612,22 +531,11 @@ st.markdown(
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    st.metric(
-        "Exemplos rotulados",
-        current_stats["total"],
-    )
-
+    st.metric("Exemplos rotulados", current_stats["total"])
 with c2:
-    st.metric(
-        "Mínimo espécie",
-        MIN_SPECIES_SAMPLES,
-    )
-
+    st.metric("Mínimo espécie", MIN_SPECIES_SAMPLES)
 with c3:
-    st.metric(
-        "Mínimo raça",
-        MIN_BREED_SAMPLES,
-    )
+    st.metric("Mínimo raça", MIN_BREED_SAMPLES)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +543,6 @@ with c3:
 # ---------------------------------------------------------------------------
 
 st.divider()
-
 st.markdown(
     """
     <div class="pet-card">
@@ -656,103 +563,50 @@ with train_col1:
     layer = st.selectbox(
         "Camada",
         ["species", "breed"],
-        format_func=lambda x: (
-            "Camada 1 · Gato/Cachorro"
-            if x == "species"
-            else "Camada 2 · Raça"
-        ),
+        format_func=lambda x: "Camada 1 · Gato/Cachorro" if x == "species" else "Camada 2 · Raça",
     )
 
 with train_col2:
-    epochs = st.selectbox(
-        "Épocas",
-        [1, 2, 3, 5],
-        index=1,
-    )
+    epochs = st.selectbox("Épocas", [1, 2, 3, 5], index=1)
 
 state = trainer.state()
 
 if state["running"]:
-    progress_card(
-        f"Treinando {state['layer']}",
-        state["progress"],
-    )
-
-    st.info(
-        state["message"]
-    )
-
+    progress_card(f"Treinando {state['layer']}", state["progress"])
+    st.info(state["message"])
     time.sleep(.25)
     st.rerun()
 
-if st.button(
-    "🚀 Retreinar modelo",
-    use_container_width=True,
-    disabled=state["running"],
-):
+if st.button("🚀 Retreinar modelo", use_container_width=True, disabled=state["running"]):
     try:
-        trainer.start(
-            layer,
-            epochs,
-        )
-
+        trainer.start(layer, epochs)
         st.rerun()
-
     except Exception as exc:
         st.error(str(exc))
 
-
 state = trainer.state()
 
-if (
-    state["result"]
-    and not state["running"]
-):
+if state["result"] and not state["running"]:
     result_train = state["result"]
-
-    st.success(
-        state["message"]
-    )
-
+    st.success(state["message"])
     a, b, c = st.columns(3)
-
     with a:
-        st.metric(
-            "Amostras",
-            result_train["samples"],
-        )
-
+        st.metric("Amostras", result_train["samples"])
     with b:
-        st.metric(
-            "Loss",
-            f"{result_train['loss']:.4f}",
-        )
-
+        st.metric("Loss", f"{result_train['loss']:.4f}")
     with c:
-        st.metric(
-            "Validação",
-            f"{result_train['accuracy'] * 100:.1f}%",
-        )
+        st.metric("Validação", f"{result_train['accuracy'] * 100:.1f}%")
 
 
 # ---------------------------------------------------------------------------
 # Histórico
 # ---------------------------------------------------------------------------
 
-with st.expander(
-    "📊 Histórico de treinamentos"
-):
+with st.expander("📊 Histórico de treinamentos"):
     if current_stats["runs"]:
-        st.dataframe(
-            current_stats["runs"],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(current_stats["runs"], use_container_width=True, hide_index=True)
     else:
-        st.caption(
-            "Nenhum treinamento executado ainda."
-        )
-
+        st.caption("Nenhum treinamento executado ainda.")
 
 st.markdown(
     """
