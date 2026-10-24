@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import time
 import math
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -215,12 +216,6 @@ if "species_edit" not in st.session_state:
 if "breed_edit" not in st.session_state:
     st.session_state.breed_edit = ""
 
-# NOVO: Guardar as métricas calculadas para não recalcular a cada rerun
-if "metricas_species" not in st.session_state:
-    st.session_state.metricas_species = None
-if "metricas_breed" not in st.session_state:
-    st.session_state.metricas_breed = None
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,111 +249,36 @@ def calc_entropy(probs):
 
 
 # ---------------------------------------------------------------------------
-# CÁLCULO DE MÉTRICAS REAIS (Reutilizável)
-# ---------------------------------------------------------------------------
-
-def calcular_metricas_reais(layer, label_key, base_dir):
-    """Carrega o modelo e roda a inferência para calcular métricas reais."""
-    custom_dir = Path(base_dir).parent / "custom" / layer
-
-    if not (custom_dir / "config.json").exists():
-        return None
-
-    try:
-        processor = AutoImageProcessor.from_pretrained(custom_dir)
-        model = AutoModelForImageClassification.from_pretrained(custom_dir)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)
-        model.eval()
-
-        rows = feedback_rows()
-        valid_rows = [r for r in rows if r.get(label_key)]
-
-        if len(valid_rows) < 2:
-            return None
-
-        y_true = []
-        y_pred = []
-        id2label = model.config.id2label
-        label2id = model.config.label2id
-
-        with torch.inference_mode():
-            for row in valid_rows:
-                true_label_text = row[label_key]
-                
-                if true_label_text not in label2id:
-                    continue
-
-                try:
-                    image = Image.open(row["path"]).convert("RGB")
-                    inputs = processor(images=image, return_tensors="pt").to(device)
-                    logits = model(**inputs).logits
-                    pred_id = logits.argmax(dim=-1).item()
-                    
-                    y_true.append(true_label_text)
-                    y_pred.append(id2label[pred_id])
-                except Exception:
-                    continue
-
-        if not y_true:
-            return None
-
-        labels_presentes = sorted(list(set(y_true + y_pred)))
-        
-        report = classification_report(y_true, y_pred, labels=labels_presentes, output_dict=True, zero_division=0)
-        
-        weighted_avg = report.get("weighted avg", {})
-        
-        return {
-            "report": report,
-            "accuracy": report.get("accuracy", 0.0),
-            "precision": weighted_avg.get("precision", 0.0),
-            "recall": weighted_avg.get("recall", 0.0),
-            "f1": weighted_avg.get("f1-score", 0.0),
-        }
-
-    except Exception as e:
-        return None
-
-
-# ---------------------------------------------------------------------------
 # POPUP DE MÉTRICAS DETALHADAS
 # ---------------------------------------------------------------------------
 
 @st.dialog("Relatório de Classificação Detalhado", width="large")
 def mostrar_popup_metricas():
     st.markdown("### Relatório de Classificação por Classe")
-    st.caption("Mostra o desempenho do modelo para cada classe individualmente.")
+    st.caption("Mostra o desempenho do modelo nos dados de validação (dados que ele não viu no treino).")
     
-    # Verifica qual modelo foi treinado para exibir por padrão
-    tem_species = st.session_state.metricas_species is not None
-    tem_breed = st.session_state.metricas_breed is not None
+    current_stats = stats()
+    # Pega apenas o último treino de cada camada que tenha relatório salvo
+    last_species_run = next((r for r in current_stats["runs"] if r["layer"] == "species" and r.get("report")), None)
+    last_breed_run = next((r for r in current_stats["runs"] if r["layer"] == "breed" and r.get("report")), None)
 
-    if not tem_species and not tem_breed:
-        st.warning("Nenhum modelo treinado encontrado.")
+    if not last_species_run and not last_breed_run:
+        st.warning("Nenhum modelo treinado com relatório válido encontrado.")
         return
 
     opcoes = []
-    if tem_species:
-        opcoes.append("Espécie (Gato/Cachorro)")
-    if tem_breed:
-        opcoes.append("Raça")
+    if last_species_run: opcoes.append("Espécie (Gato/Cachorro)")
+    if last_breed_run: opcoes.append("Raça")
         
     camada = st.radio("Selecione a camada:", opcoes, horizontal=True)
     
-    if camada.startswith("Espécie"):
-        metrics_data = st.session_state.metricas_species
-    else:
-        metrics_data = st.session_state.metricas_breed
-
-    if metrics_data is None:
-        st.warning("Sem dados para esta camada.")
-        return
+    # Pega o dicionário do relatório salvo no banco
+    run_selecionado = last_species_run if camada.startswith("Espécie") else last_breed_run
+    metrics_data = json.loads(run_selecionado["report"]) 
 
     # --- EXIBIR TABELA DE RELATÓRIO ---
-    df_report = pd.DataFrame(metrics_data["report"]).transpose()
+    df_report = pd.DataFrame(metrics_data).transpose()
     
-    # Renomeia as colunas para ficarem mais amigáveis
     df_report = df_report.rename(columns={
         "precision": "Precisão",
         "recall": "Recall",
@@ -372,7 +292,7 @@ def mostrar_popup_metricas():
             "Recall": "{:.2f}",
             "F1-Score": "{:.2f}",
             "Suporte": "{:.0f}"
-        }),
+        }, na_rep="-"), 
         use_container_width=True
     )
 
@@ -755,12 +675,6 @@ if st.session_state.result:
 st.divider()
 current_stats = stats()
 
-# Calcula as métricas se ainda não estiverem no session_state
-if st.session_state.metricas_species is None and current_stats.get("runs"):
-    st.session_state.metricas_species = calcular_metricas_reais("species", "species", SPECIES_DIR)
-    st.session_state.metricas_breed = calcular_metricas_reais("breed", "breed", BREED_DIR)
-
-
 col_dataset, col_metrics = st.columns([1, 1], gap="large")
 
 with col_dataset:
@@ -797,32 +711,42 @@ with col_metrics:
               📈 Métricas Globais do Modelo
             </div>
             <div class="pet-muted mt-1">
-              Desempenho no último treinamento.
+              Desempenho no último treinamento (Dados de Validação).
             </div>
             """,
             unsafe_allow_html=True,
         )
     
     with c_btn:
-        # Só mostra o botão se houver algum modelo treinado
-        if st.session_state.metricas_species or st.session_state.metricas_breed:
+        # Verifica se há algum relatório salvo nos últimos runs
+        tem_relatorio = any(r.get("report") for r in current_stats["runs"])
+        if tem_relatorio:
             if st.button("➕", help="Ver Relatório Detalhado", use_container_width=True):
                 mostrar_popup_metricas()
 
-    # Decide qual métrica exibir no card principal (prioriza Raça se existir, senão Espécie)
-    metrics_data = st.session_state.metricas_breed if st.session_state.metricas_breed else st.session_state.metricas_species
-    tipo_modelo = "Raça" if st.session_state.metricas_breed else "Espécie"
+    # Pega o último treino que tem accuracy e report
+    last_run = next((r for r in current_stats["runs"] if r.get("report")), None)
 
-    if metrics_data:
-        # Formata os números de forma segura
-        acc_str = f"{metrics_data['accuracy']*100:.1f}%"
-        prec_str = f"{metrics_data['precision']*100:.1f}%"
-        rec_str = f"{metrics_data['recall']*100:.1f}%"
-        f1_str = f"{metrics_data['f1']*100:.1f}%"
-
+    if last_run:
+        tipo_modelo = "Raça" if last_run["layer"] == "breed" else "Espécie"
         st.caption(f"Exibindo métricas do modelo treinado: **{tipo_modelo}**")
         
-        # Usando st.columns + HTML customizado para não cortar os números
+        # Puxa os dados do JSON salvo no banco
+        report_dict = json.loads(last_run["report"])
+        
+        # No classification_report, a acurácia fica na chave 'accuracy'
+        acc = report_dict.get("accuracy", 0.0)
+        # As médias ponderadas ficam em 'weighted avg'
+        weighted = report_dict.get("weighted avg", {})
+        prec = weighted.get("precision", 0.0)
+        rec = weighted.get("recall", 0.0)
+        f1 = weighted.get("f1-score", 0.0)
+
+        acc_str = f"{acc*100:.1f}%"
+        prec_str = f"{prec*100:.1f}%"
+        rec_str = f"{rec*100:.1f}%"
+        f1_str = f"{f1*100:.1f}%"
+
         m1, m2, m3, m4 = st.columns(4)
         
         with m1:
@@ -902,9 +826,6 @@ if state["running"]:
 if st.button("🚀 Retreinar modelo", use_container_width=True, disabled=state["running"]):
     try:
         trainer.start(layer, epochs)
-        # Limpa o cache de métricas para forçar o recálculo após o treino
-        st.session_state.metricas_species = None
-        st.session_state.metricas_breed = None
         st.rerun()
     except Exception as exc:
         st.error(str(exc))

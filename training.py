@@ -3,9 +3,11 @@ import threading
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from sklearn.metrics import classification_report
+from sklearn.model_selection import StratifiedShuffleSplit
+import numpy as np
 
 from config import (
     SPECIES_DIR,
@@ -34,13 +36,8 @@ class FeedbackDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.rows[index]
-
         image = Image.open(row["path"]).convert("RGB")
-
-        encoded = self.processor(
-            images=image,
-            return_tensors="pt",
-        )
+        encoded = self.processor(images=image, return_tensors="pt")
 
         return {
             "pixel_values": encoded["pixel_values"].squeeze(0),
@@ -50,25 +47,9 @@ class FeedbackDataset(Dataset):
 
 def _layer_data(layer):
     rows = feedback_rows()
-
     if layer == "species":
-        return [
-            {
-                **row,
-                "label": row["species"],
-            }
-            for row in rows
-            if row["species"]
-        ]
-
-    return [
-        {
-            **row,
-            "label": row["breed"],
-        }
-        for row in rows
-        if row["breed"]
-    ]
+        return [{**row, "label": row["species"]} for row in rows if row["species"]]
+    return [{**row, "label": row["breed"]} for row in rows if row["breed"]]
 
 
 def _resolve_source(custom_dir, base_dir, model_id):
@@ -80,9 +61,6 @@ def _resolve_source(custom_dir, base_dir, model_id):
 
 
 def _merge_labels(base_id2label, feedback_labels):
-    """
-    Mescla o label map do modelo base com os labels vindos do feedback.
-    """
     id2label = {int(k): v for k, v in base_id2label.items()}
     label2id = {v: int(k) for k, v in id2label.items()}
 
@@ -100,77 +78,61 @@ def _merge_labels(base_id2label, feedback_labels):
 
 
 def _expand_classifier(model, old_size, new_size):
-    """
-    Expande o head classificador preservando os pesos das classes antigas.
-    """
-    head = model.classifier
-
-    new_head = torch.nn.Linear(
-        head.in_features,
-        new_size,
-    )
-
-    with torch.no_grad():
-        new_head.weight[:old_size] = head.weight[:old_size]
-        new_head.bias[:old_size] = head.bias[:old_size]
-
-    model.classifier = new_head
+    # Em modelos ViT, o classificador pode se chamar 'classifier' ou fazer parte de 'heads'
+    if hasattr(model, "classifier"):
+        head = model.classifier
+        new_head = torch.nn.Linear(head.in_features, new_size)
+        with torch.no_grad():
+            new_head.weight[:old_size] = head.weight[:old_size]
+            new_head.bias[:old_size] = head.bias[:old_size]
+        model.classifier = new_head
+    else:
+        # Fallback para modelos que usam 'heads'
+        head = model.heads.head if hasattr(model, "heads") else model.classifier
+        # Cria a nova camada baseada no modelo original
+        in_features = model.config.hidden_size
+        new_head = torch.nn.Linear(in_features, new_size)
+        with torch.no_grad():
+             new_head.weight[:old_size] = head.weight[:old_size]
+             new_head.bias[:old_size] = head.bias[:old_size]
+        # Aplica no modelo (depende da arquitetura exata do ViT)
+        if hasattr(model, "heads"):
+            model.heads.head = new_head
+        else:
+            model.classifier = new_head
 
 
 def train_layer(
     layer,
     epochs=2,
     batch_size=4,
-    learning_rate=2e-5,
+    learning_rate=2e-5, 
     progress_callback=None,
 ):
     rows = _layer_data(layer)
-
-    minimum = (
-        MIN_SPECIES_SAMPLES
-        if layer == "species"
-        else MIN_BREED_SAMPLES
-    )
+    minimum = MIN_SPECIES_SAMPLES if layer == "species" else MIN_BREED_SAMPLES
 
     if len(rows) < minimum:
-        raise ValueError(
-            f"São necessários pelo menos {minimum} exemplos. "
-            f"Existem {len(rows)}."
-        )
+        raise ValueError(f"São necessários pelo menos {minimum} exemplos. Existem {len(rows)}.")
 
     feedback_labels = sorted({row["label"] for row in rows})
-
     if not feedback_labels:
-        raise ValueError(
-            "Nenhuma classe válida foi encontrada."
-        )
+        raise ValueError("Nenhuma classe válida foi encontrada.")
 
     if layer == "species":
-        base_dir = SPECIES_DIR
-        model_id = SPECIES_MODEL
+        base_dir, model_id = SPECIES_DIR, SPECIES_MODEL
     else:
-        base_dir = BREED_DIR
-        model_id = BREED_MODEL
+        base_dir, model_id = BREED_DIR, BREED_MODEL
 
     custom_dir = Path(base_dir).parent / "custom" / layer
-
     source = _resolve_source(custom_dir, base_dir, model_id)
 
     processor = AutoImageProcessor.from_pretrained(source)
-
     model = AutoModelForImageClassification.from_pretrained(source)
-
-    # -----------------------------------------------------------------
-    # Mergulhar labels: mantém o que o modelo já sabe + adiciona novo
-    # -----------------------------------------------------------------
 
     base_id2label = dict(model.config.id2label)
     base_size = len(base_id2label)
-
-    merged_id2label, merged_label2id, added = _merge_labels(
-        base_id2label,
-        feedback_labels,
-    )
+    merged_id2label, merged_label2id, added = _merge_labels(base_id2label, feedback_labels)
 
     if added:
         _expand_classifier(model, base_size, len(merged_id2label))
@@ -178,94 +140,54 @@ def train_layer(
     model.config.id2label = merged_id2label
     model.config.label2id = merged_label2id
     model.config.num_labels = len(merged_id2label)
-
     label_map = merged_label2id
 
-    # -----------------------------------------------------------------
-    # Dataset / split
-    # -----------------------------------------------------------------
-
+    # Preparar os dados para o Split Estratificado
     dataset = FeedbackDataset(rows, processor, label_map)
+    targets = [label_map[row["label"]] for row in rows]
 
-    if len(dataset) == 1:
-        train_dataset = dataset
-        validation_dataset = None
-    else:
-        validation_count = max(1, int(len(dataset) * 0.2))
-        train_count = len(dataset) - validation_count
+    # Se tiver poucas imagens por classe, o split tradicional falha. Vamos garantir 1 de cada na validação.
+    if len(np.unique(targets)) < 2:
+         raise ValueError("Você precisa de pelo menos 2 raças diferentes no banco para treinar.")
 
-        if train_count < 1:
-            train_count = 1
-            validation_count = len(dataset) - 1
+    # StratifiedShuffleSplit garante que todas as raças apareçam no treino e na validação
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    
+    # Se o dataset for muito pequeno (ex: 5 imagens), pode ser que falte dados para o split.
+    # O max(1) garante que sempre terá pelo menos 1 imagem na validação.
+    try:
+        train_idx, val_idx = next(splitter.split(targets, targets))
+    except ValueError:
+        # Fallback se não houver amostras suficientes por classe
+        raise ValueError("Você precisa de mais imagens de cada raça para fazer o treino e a validação.")
 
-        train_dataset, validation_dataset = random_split(
-            dataset,
-            [train_count, validation_count],
-            generator=torch.Generator().manual_seed(42),
-        )
+    train_dataset = Subset(dataset, train_idx)
+    validation_dataset = Subset(dataset, val_idx)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
-
-    validation_loader = None
-
-    if validation_dataset is not None:
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
-    # -----------------------------------------------------------------
-    # Estratégia de treino
-    # -----------------------------------------------------------------
-    samples_per_class = len(rows) / max(1, len(feedback_labels))
-    small_dataset = samples_per_class < 10
+    # IMPORTANTE: Descongelar o modelo inteiro para ele aprender a nova raça
+    for param in model.parameters():
+        param.requires_grad = True
 
-    freeze_backbone = added or small_dataset
-
-    if freeze_backbone:
-        for name, param in model.named_parameters():
-            if not name.startswith("classifier"):
-                param.requires_grad = False
-
-        trainable = [p for p in model.parameters() if p.requires_grad]
-
-        optimizer = torch.optim.AdamW(
-            trainable,
-            lr=1e-3,
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-        )
+    # Learning rate um pouco menor para não destruir o modelo antigo (evitar Catastrophic Forgetting)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
     total_steps = max(1, epochs * len(train_loader))
-
     step = 0
     last_loss = 0.0
 
     for epoch in range(epochs):
         model.train()
-
         for batch in train_loader:
             pixel_values = batch["pixel_values"].to(device)
             labels_tensor = batch["labels"].to(device)
 
-            output = model(
-                pixel_values=pixel_values,
-                labels=labels_tensor,
-            )
-
+            output = model(pixel_values=pixel_values, labels=labels_tensor)
             loss = output.loss
 
             optimizer.zero_grad(set_to_none=True)
@@ -274,43 +196,34 @@ def train_layer(
 
             last_loss = float(loss.detach().cpu())
             step += 1
-
             if progress_callback:
                 progress_callback(int(step / total_steps * 85))
 
     model.eval()
 
-    # -----------------------------------------------------------------
-    # Validação real e cálculo do relatório
-    # -----------------------------------------------------------------
     y_true = []
     y_pred = []
 
-    if validation_loader is not None:
-        with torch.inference_mode():
-            for batch in validation_loader:
-                pixel_values = batch["pixel_values"].to(device)
-                labels_tensor = batch["labels"].to(device)
+    with torch.inference_mode():
+        for batch in validation_loader:
+            pixel_values = batch["pixel_values"].to(device)
+            labels_tensor = batch["labels"].to(device)
 
-                output = model(pixel_values=pixel_values, labels=labels_tensor)
-                logits = output.logits
-                last_loss = float(output.loss.detach().cpu())
-                
-                predictions = logits.argmax(dim=-1)
+            output = model(pixel_values=pixel_values, labels=labels_tensor)
+            logits = output.logits
+            last_loss = float(output.loss.detach().cpu())
+            predictions = logits.argmax(dim=-1)
 
-                y_true.extend(labels_tensor.cpu().tolist())
-                y_pred.extend(predictions.cpu().tolist())
+            y_true.extend(labels_tensor.cpu().tolist())
+            y_pred.extend(predictions.cpu().tolist())
 
     total = len(y_true)
     correct = sum(1 for t, p in zip(y_true, y_pred) if t == p)
     accuracy = (correct / total) if total > 0 else 0.0
 
-    # Gera o relatório de classificação para o popup
     labels_presentes = sorted(list(set(y_true + y_pred)))
     target_names = [merged_id2label[i] for i in labels_presentes]
     
-    # Importação dentro da função para evitar erro caso o sklearn não esteja instalado
-    from sklearn.metrics import classification_report
     report = classification_report(
         y_true, 
         y_pred, 
@@ -321,7 +234,6 @@ def train_layer(
     )
 
     custom_dir.mkdir(parents=True, exist_ok=True)
-
     model.save_pretrained(custom_dir)
     processor.save_pretrained(custom_dir)
 
@@ -336,8 +248,8 @@ def train_layer(
         "loss": last_loss,
         "accuracy": accuracy,
         "device": device,
-        "frozen_backbone": freeze_backbone,
-        "report": report, # Retorna o relatório detalhado
+        "frozen_backbone": False, # Agora sempre False
+        "report": report,
     }
 
 
@@ -380,12 +292,7 @@ class Trainer:
 
     def _worker(self, layer, epochs):
         rows = _layer_data(layer)
-
-        run_id = create_training(
-            layer,
-            len(rows),
-            epochs,
-        )
+        run_id = create_training(layer, len(rows), epochs)
 
         try:
             with self.lock:
@@ -406,6 +313,7 @@ class Trainer:
                 "completed",
                 loss=result["loss"],
                 accuracy=result["accuracy"],
+                report=result["report"],
             )
 
             reload_models()

@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import datetime, timezone
 
 from config import DB_PATH
@@ -51,6 +52,7 @@ def init_db():
             epochs INTEGER,
             loss REAL,
             accuracy REAL,
+            report TEXT, 
             created_at TEXT NOT NULL,
             finished_at TEXT,
             error TEXT
@@ -181,15 +183,18 @@ def create_training(layer, samples, epochs):
     return run_id
 
 
-def finish_training(run_id, status, loss=None, accuracy=None, error=None):
+def finish_training(run_id, status, loss=None, accuracy=None, report=None, error=None):
     conn = connect()
+    # Converte o dicionário do relatório para string JSON
+    report_str = json.dumps(report) if report else None 
+    
     conn.execute(
         """
         UPDATE training_runs
-        SET status=?,loss=?,accuracy=?,finished_at=?,error=?
+        SET status=?,loss=?,accuracy=?,report=?,finished_at=?,error=?
         WHERE id=?
         """,
-        (status, loss, accuracy, now(), error, run_id),
+        (status, loss, accuracy, report_str, now(), error, run_id),
     )
     conn.commit()
     conn.close()
