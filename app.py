@@ -116,6 +116,11 @@ st.markdown(
       section[data-testid="stSidebar"] {
         background: #080b14;
       }
+      
+      /* Ajuste para remover espaçamentos fantasmas do Streamlit */
+      div[data-testid="stMarkdownContainer"] > div {
+         margin-bottom: 0px;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -219,17 +224,8 @@ left, right = st.columns(
 )
 
 with left:
-    st.markdown(
-        """
-        <div class="pet-card">
-          <div class="pet-title text-lg">Imagem</div>
-          <div class="pet-muted mt-1">
-            Envie JPG, PNG ou WEBP
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("#### Imagem")
+    st.caption("Envie JPG, PNG ou WEBP")
 
     uploaded = st.file_uploader(
         "Arraste uma imagem ou selecione um arquivo",
@@ -316,16 +312,23 @@ with right:
     result = st.session_state.result
 
     if not result:
+        # AJUSTE: Adicionado espaçador físico aqui também para manter a simetria
+        st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
         st.info(
             "Envie uma imagem para iniciar a detecção."
         )
     else:
         species_top = result["species_top"]
-        breed_top = result["breed_top"]
+        
+        # Verifica se a espécie detectada é gato ou cachorro
+        is_pet = species_top["label"].lower() in ["cat", "dog"]
+
+        # AJUSTE: Espaçador físico FIXO que sempre será renderizado, independente do estado
+        st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
 
         st.markdown(
             f"""
-            <div class="pet-result mt-4">
+            <div class="pet-result">
               <div class="pet-muted uppercase tracking-wider">
                 Camada 1 · espécie
               </div>
@@ -342,38 +345,54 @@ with right:
             unsafe_allow_html=True,
         )
 
-        st.markdown(
-            f"""
-            <div class="pet-result mt-3">
-              <div class="pet-muted uppercase tracking-wider">
-                Camada 2 · raça
-              </div>
+        # Só exibe a camada 2 se for gato ou cachorro
+        if is_pet:
+            breed_top = result["breed_top"]
+            
+            # AJUSTE: Espaçador físico antes da Camada 2
+            st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
+            
+            st.markdown(
+                f"""
+                <div class="pet-result">
+                  <div class="pet-muted uppercase tracking-wider">
+                    Camada 2 · raça
+                  </div>
 
-              <div class="text-2xl font-black text-white mt-2">
-                {pretty(breed_top["label"])}
-              </div>
+                  <div class="text-2xl font-black text-white mt-2">
+                    {pretty(breed_top["label"])}
+                  </div>
 
-              <div class="text-indigo-300 font-bold mt-1">
-                {confidence(breed_top["probability"])}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                  <div class="text-indigo-300 font-bold mt-1">
+                    {confidence(breed_top["probability"])}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
+            st.info(
+                "A camada de raça não é aplicada para esta espécie."
+            )
 
+        # Adicionado espaçamento antes do caption
+        st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
         st.caption(
             f"Dispositivo utilizado: {result['device']}"
         )
 
-        st.markdown(
-            "### Top classificações"
-        )
-
-        for item in result["breed"]:
-            st.write(
-                f"**{pretty(item['label'])}** — "
-                f"{confidence(item['probability'])}"
+        # Só exibe as top classificações de raça se for pet
+        if is_pet:
+            st.markdown(
+                "### Top classificações"
             )
+
+            for item in result["breed"]:
+                st.write(
+                    f"**{pretty(item['label'])}** — "
+                    f"{confidence(item['probability'])}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -400,150 +419,117 @@ if st.session_state.result:
     result = st.session_state.result
 
     species_label = result["species_top"]["label"].lower()
-
-    if species_label not in ["cat", "dog"]:
-        species_label = "dog"
+    
+    species_options = ["cat", "dog"]
+    
+    if species_label in species_options:
+        species_index = species_options.index(species_label)
+    else:
+        species_index = None 
 
     species_edit = st.selectbox(
         "Espécie correta",
-        ["cat", "dog"],
-        index=(
-            0
-            if species_label == "cat"
-            else 1
-        ),
+        species_options,
+        index=species_index,
         format_func=lambda x: (
             "Gato"
             if x == "cat"
             else "Cachorro"
         ),
+        placeholder="Selecione a espécie correta...",
     )
 
-    breed_default = result["breed_top"]["label"]
+    if species_edit in ["cat", "dog"]:
+        breed_default = result["breed_top"]["label"]
 
-    known_breeds = sorted({
-        item["label"]
-        for item in result["breed"]
-    } | {
-        breed_default
-    })
+        known_breeds = sorted({
+            item["label"]
+            for item in result["breed"]
+        } | {
+            breed_default
+        })
 
-    NEW_BREED_OPTION = "➕ Outra raça (digitar)"
+        NEW_BREED_OPTION = "➕ Outra raça (digitar)"
 
-    breed_options = known_breeds + [NEW_BREED_OPTION]
+        breed_options = known_breeds + [NEW_BREED_OPTION]
 
-    breed_choice = st.selectbox(
-        "Raça correta",
-        breed_options,
-        index=0,
-        format_func=lambda x: (
-            x
-            if x == NEW_BREED_OPTION
-            else pretty(x)
-        ),
-    )
-
-    # ---------------------------------------------------------------------
-    # Novo rótulo: permite enviar várias amostras da mesma raça
-    # ---------------------------------------------------------------------
-
-    extra_samples = []
-    include_current = True
-
-    if breed_choice == NEW_BREED_OPTION:
-        breed_custom = st.text_input(
-            "Nome da raça",
-            placeholder="Ex.: Pastor Alemão, SRD, Maine Coon...",
-            help=(
-                "Digite o nome da raça. O texto será normalizado "
-                "(ex.: 'Pastor Alemão' → 'pastor_alemao') para manter "
-                "consistência com os labels do modelo."
+        breed_choice = st.selectbox(
+            "Raça correta",
+            breed_options,
+            index=0,
+            format_func=lambda x: (
+                x
+                if x == NEW_BREED_OPTION
+                else pretty(x)
             ),
         )
 
-        breed_edit = normalize_label(breed_custom)
+        extra_samples = []
+        include_current = True
 
-        if breed_custom.strip():
-            st.caption(
-                f"Label que será salvo: `{breed_edit}`"
+        if breed_choice == NEW_BREED_OPTION:
+            breed_custom = st.text_input(
+                "Nome da raça",
+                placeholder="Ex.: Pastor Alemão, SRD, Maine Coon...",
+                help=(
+                    "Digite o nome da raça. O texto será normalizado "
+                    "(ex.: 'Pastor Alemão' → 'pastor_alemao') para manter "
+                    "consistência com os labels do modelo."
+                ),
             )
 
-        include_current = st.checkbox(
-            "Incluir também a imagem detectada acima",
-            value=True,
-            help=(
-                "Desmarque se a imagem acima não pertence à raça "
-                "que você está cadastrando."
-            ),
-        )
+            breed_edit = normalize_label(breed_custom)
 
-        extra_samples = st.file_uploader(
-            "Imagens de amostra para o novo rótulo (opcional)",
-            type=["jpg", "jpeg", "png", "webp"],
-            accept_multiple_files=True,
-            key="new_breed_samples",
-            help=(
-                "Envie várias imagens da mesma raça. Todas serão "
-                "salvas no dataset local com o rótulo digitado acima "
-                "e a espécie selecionada."
-            ),
-        )
+            if breed_custom.strip():
+                st.caption(
+                    f"Label que será salvo: `{breed_edit}`"
+                )
 
-        if extra_samples:
-            st.caption(
-                f"{len(extra_samples)} imagem(ns) adicional(is) serão "
-                f"rotuladas como `{breed_edit or '—'}`."
+            include_current = st.checkbox(
+                "Incluir também a imagem detectada acima",
+                value=True,
+                help=(
+                    "Desmarque se a imagem acima não pertence à raça "
+                    "que você está cadastrando."
+                ),
             )
-    else:
-        breed_edit = breed_choice
 
-    # ---------------------------------------------------------------------
-    # Salvar
-    # ---------------------------------------------------------------------
-
-    if st.button(
-        "💾 Salvar correção para treinamento",
-        use_container_width=True,
-    ):
-        if not breed_edit:
-            st.warning(
-                "Informe o nome da raça antes de salvar."
+            extra_samples = st.file_uploader(
+                "Imagens de amostra para o novo rótulo (opcional)",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True,
+                key="new_breed_samples",
+                help=(
+                    "Envie várias imagens da mesma raça. Todas serão "
+                    "salvas no dataset local com o rótulo digitado acima "
+                    "e a espécie selecionada."
+                ),
             )
-        else:
-            saved = 0
-            failed = 0
 
-            # 1) Imagem detectada (opcional)
-            if include_current and st.session_state.image_id:
-                try:
-                    add_feedback(
-                        st.session_state.image_id,
-                        species_edit,
-                        breed_edit,
-                    )
-                    saved += 1
-                except Exception as exc:
-                    failed += 1
-                    st.error(
-                        f"Falha na imagem detectada: {exc}"
-                    )
-
-            # 2) Amostras adicionais em lote
             if extra_samples:
-                bar = st.progress(0)
-                status = st.empty()
-                total = len(extra_samples)
+                st.caption(
+                    f"{len(extra_samples)} imagem(ns) adicional(is) serão "
+                    f"rotuladas como `{breed_edit or '—'}`."
+                )
+        else:
+            breed_edit = breed_choice
 
-                for index, sample in enumerate(extra_samples, start=1):
-                    status.caption(
-                        f"Salvando {index}/{total} · {sample.name}"
-                    )
+        if st.button(
+            "💾 Salvar correção para treinamento",
+            use_container_width=True,
+        ):
+            if not breed_edit:
+                st.warning(
+                    "Informe o nome da raça antes de salvar."
+                )
+            else:
+                saved = 0
+                failed = 0
 
+                if include_current and st.session_state.image_id:
                     try:
-                        filename, path = save_image(sample)
-                        new_id = add_image(filename, path)
                         add_feedback(
-                            new_id,
+                            st.session_state.image_id,
                             species_edit,
                             breed_edit,
                         )
@@ -551,24 +537,54 @@ if st.session_state.result:
                     except Exception as exc:
                         failed += 1
                         st.error(
-                            f"Falha em {sample.name}: {exc}"
+                            f"Falha na imagem detectada: {exc}"
                         )
 
-                    bar.progress(index / total)
+                if extra_samples:
+                    bar = st.progress(0)
+                    status = st.empty()
+                    total = len(extra_samples)
 
-                status.empty()
-                bar.empty()
+                    for index, sample in enumerate(extra_samples, start=1):
+                        status.caption(
+                            f"Salvando {index}/{total} · {sample.name}"
+                        )
 
-            if saved:
-                st.success(
-                    f"{saved} imagem(ns) salva(s) no dataset local "
-                    f"com o rótulo `{breed_edit}`."
-                )
+                        try:
+                            filename, path = save_image(sample)
+                            new_id = add_image(filename, path)
+                            add_feedback(
+                                new_id,
+                                species_edit,
+                                breed_edit,
+                            )
+                            saved += 1
+                        except Exception as exc:
+                            failed += 1
+                            st.error(
+                                f"Falha em {sample.name}: {exc}"
+                            )
 
-            if failed:
-                st.warning(
-                    f"{failed} imagem(ns) falharam ao salvar."
-                )
+                        bar.progress(index / total)
+
+                    status.empty()
+                    bar.empty()
+
+                if saved:
+                    st.success(
+                        f"{saved} imagem(ns) salva(s) no dataset local "
+                        f"com o rótulo `{breed_edit}`."
+                    )
+
+                if failed:
+                    st.warning(
+                        f"{failed} imagem(ns) falharam ao salvar."
+                    )
+    else:
+        st.info(
+            "A correção de raça só está disponível para cães e gatos. "
+            "Selecione a espécie correta acima."
+        )
 
 
 # ---------------------------------------------------------------------------
