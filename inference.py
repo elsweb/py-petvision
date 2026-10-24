@@ -40,6 +40,39 @@ def _resolve_source(base_dir, model_id, layer):
     return model_id
 
 
+def _normalize_config(model):
+    """
+    Garante id2label/label2id com tipos consistentes (int -> str).
+
+    Sem isso, após save_pretrained/from_pretrained as chaves de id2label
+    voltam como string ("0", "1", ...) e o lookup por índice int falha,
+    fazendo a inferência retornar "0", "1", "2" em vez dos labels reais.
+    """
+    id2label = {int(k): v for k, v in model.config.id2label.items()}
+    label2id = {v: int(k) for k, v in id2label.items()}
+
+    model.config.id2label = id2label
+    model.config.label2id = label2id
+    model.config.num_labels = len(id2label)
+
+    return model
+
+
+def _load_layer(base_dir, model_id, layer):
+    source = _resolve_source(base_dir, model_id, layer)
+
+    processor = AutoImageProcessor.from_pretrained(source)
+    model = AutoModelForImageClassification.from_pretrained(
+        source,
+        ignore_mismatched_sizes=True,
+    )
+    model.to(DEVICE)
+    model.eval()
+    model = _normalize_config(model)
+
+    return processor, model
+
+
 def load_models():
     global _species_processor
     global _species_model
@@ -47,34 +80,18 @@ def load_models():
     global _breed_model
 
     if _species_model is None:
-        source = _resolve_source(
+        _species_processor, _species_model = _load_layer(
             SPECIES_DIR,
             SPECIES_MODEL,
             "species",
         )
 
-        _species_processor = AutoImageProcessor.from_pretrained(source)
-        _species_model = AutoModelForImageClassification.from_pretrained(
-            source,
-            ignore_mismatched_sizes=True,
-        )
-        _species_model.to(DEVICE)
-        _species_model.eval()
-
     if _breed_model is None:
-        source = _resolve_source(
+        _breed_processor, _breed_model = _load_layer(
             BREED_DIR,
             BREED_MODEL,
             "breed",
         )
-
-        _breed_processor = AutoImageProcessor.from_pretrained(source)
-        _breed_model = AutoModelForImageClassification.from_pretrained(
-            source,
-            ignore_mismatched_sizes=True,
-        )
-        _breed_model.to(DEVICE)
-        _breed_model.eval()
 
 
 def reload_models():
@@ -111,10 +128,13 @@ def classify(image, processor, model, top_k=5):
         min(top_k, probabilities.shape[-1]),
     )
 
+    # id2label já normalizado (chaves int) em _load_layer
+    id2label = model.config.id2label
+
     output = []
 
     for value, index in zip(values.tolist(), indexes.tolist()):
-        label = model.config.id2label.get(index, str(index))
+        label = id2label.get(int(index), str(index))
 
         output.append({
             "label": label,

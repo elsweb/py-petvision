@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import AutoImageProcessor, AutoModelForImageClassification
+from sklearn.metrics import classification_report
 
 from config import (
     SPECIES_DIR,
@@ -81,14 +82,6 @@ def _resolve_source(custom_dir, base_dir, model_id):
 def _merge_labels(base_id2label, feedback_labels):
     """
     Mescla o label map do modelo base com os labels vindos do feedback.
-
-    - Labels já conhecidos mantêm o índice original (pesos preservados).
-    - Labels novos são anexados no fim (pesos inicializados do zero).
-
-    Retorna:
-        id2label   -> dict {índice: label}
-        label2id   -> dict {label: índice}
-        new_labels -> lista de labels efetivamente adicionados
     """
     id2label = {int(k): v for k, v in base_id2label.items()}
     label2id = {v: int(k) for k, v in id2label.items()}
@@ -109,7 +102,6 @@ def _merge_labels(base_id2label, feedback_labels):
 def _expand_classifier(model, old_size, new_size):
     """
     Expande o head classificador preservando os pesos das classes antigas.
-    As novas linhas ficam com a inicialização padrão do PyTorch.
     """
     head = model.classifier
 
@@ -234,17 +226,7 @@ def train_layer(
 
     # -----------------------------------------------------------------
     # Estratégia de treino
-    #
-    # - Se adicionamos classes novas -> congela backbone.
-    #   Só o classificador é atualizado. Preserva o que o modelo base
-    #   já sabia e aprende rapidamente o head novo.
-    #
-    # - Se só estamos refinando classes existentes com poucos dados
-    #   -> congela backbone também.
-    #
-    # - Se temos bastante dado por classe -> fine-tuning completo.
     # -----------------------------------------------------------------
-
     samples_per_class = len(rows) / max(1, len(feedback_labels))
     small_dataset = samples_per_class < 10
 
@@ -298,8 +280,11 @@ def train_layer(
 
     model.eval()
 
-    correct = 0
-    total = 0
+    # -----------------------------------------------------------------
+    # Validação real e cálculo do relatório
+    # -----------------------------------------------------------------
+    y_true = []
+    y_pred = []
 
     if validation_loader is not None:
         with torch.inference_mode():
@@ -307,13 +292,33 @@ def train_layer(
                 pixel_values = batch["pixel_values"].to(device)
                 labels_tensor = batch["labels"].to(device)
 
-                logits = model(pixel_values=pixel_values).logits
+                output = model(pixel_values=pixel_values, labels=labels_tensor)
+                logits = output.logits
+                last_loss = float(output.loss.detach().cpu())
+                
                 predictions = logits.argmax(dim=-1)
 
-                correct += int((predictions == labels_tensor).sum())
-                total += int(labels_tensor.numel())
+                y_true.extend(labels_tensor.cpu().tolist())
+                y_pred.extend(predictions.cpu().tolist())
 
+    total = len(y_true)
+    correct = sum(1 for t, p in zip(y_true, y_pred) if t == p)
     accuracy = (correct / total) if total > 0 else 0.0
+
+    # Gera o relatório de classificação para o popup
+    labels_presentes = sorted(list(set(y_true + y_pred)))
+    target_names = [merged_id2label[i] for i in labels_presentes]
+    
+    # Importação dentro da função para evitar erro caso o sklearn não esteja instalado
+    from sklearn.metrics import classification_report
+    report = classification_report(
+        y_true, 
+        y_pred, 
+        labels=labels_presentes,
+        target_names=target_names,
+        output_dict=True, 
+        zero_division=0
+    )
 
     custom_dir.mkdir(parents=True, exist_ok=True)
 
@@ -332,6 +337,7 @@ def train_layer(
         "accuracy": accuracy,
         "device": device,
         "frozen_backbone": freeze_backbone,
+        "report": report, # Retorna o relatório detalhado
     }
 
 
@@ -411,16 +417,13 @@ class Trainer:
                 self.result = result
 
         except Exception as exc:
-            finish_training(
-                run_id,
-                "failed",
-                error=str(exc),
-            )
-
+            import traceback
+            tb = traceback.format_exc()
+            finish_training(run_id, "failed", error=tb)
             with self.lock:
                 self.running = False
                 self.progress = 0
-                self.message = str(exc)
+                self.message = f"{exc}\n\n{tb}"
                 self.result = None
 
 
